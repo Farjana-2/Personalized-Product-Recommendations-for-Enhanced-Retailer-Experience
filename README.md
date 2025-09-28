@@ -1,6 +1,6 @@
 ## Personalized-Product-Recommendations-for-Enhanced-Retailer-Experience
 
-a) Problem Statement Reference
+## a) Problem Statement Reference
 
 Problem Statement Chosen:
 AI-powered recommendation system for retailers on B2B marketplace platforms.
@@ -8,20 +8,19 @@ AI-powered recommendation system for retailers on B2B marketplace platforms.
 Reason to Choose the Problem Statement:
 Retailers face repetitive purchase patterns and difficulty in discovering new products that suit their needs. An AI-driven recommendation engine can help improve product discovery, optimize order baskets, and enhance business growth.
 
-b) Solution Overview
+## b) Solution Overview
 
 Proposed Approach:
 We built a hybrid recommendation system combining rule-based filters and LLM-powered insights to deliver personalized product recommendations to retailers.
 
-Key Features / Modules:
-
+## Key Features / Modules:
 OTP-based authentication & retailer registration
 Product listing & category management
 AI-driven personalized recommendations
 Cart and order management
 Notifications on new & high-selling product recommendations.
 
-c) System Architecture
+## c) System Architecture
 
 Architecture Diagram / Workflow:
 [Frontend (React)] → [Backend (FastAPI)] → [MongoDB]
@@ -29,7 +28,7 @@ Architecture Diagram / Workflow:
                                   [LLM (Emergent API)]
 
                                 
-Data Flow Explanation:
+## Data Flow Explanation:
 
 User logs in with OTP → backend verifies and stores user.
 Product data seeded into database.
@@ -37,7 +36,7 @@ Retailer places orders → backend logs transactions.
 Recommendation module uses purchase history + AI to generate recommendations.
 Frontend fetches products + recommendations and displays notifications. 
 
-d) Technology Stack
+## d) Technology Stack
 
 Backend: FastAPI, Python, Motor (MongoDB driver)
 Frontend: React.js, TailwindCSS, shadcn/ui, Axios
@@ -45,19 +44,19 @@ Databases: MongoDB (NoSQL)
 ML/AI Frameworks: Emergent LLM API, rule-based filtering logic
 APIs / Libraries: FastAPI, Uvicorn, Pydantic, dotenv, axios
 
-e) Algorithms & Models
+## e) Algorithms & Models
 
 Algorithm(s) Chosen: Hybrid Recommendation System (Rule-based filtering + LLM insights)
 Reason for Choice: Provides balance between scalability (rule-based) and personalization (LLM).
 Model Training & Testing Approach: For hackathon prototype, we used seeded product/order data. LLM generates context-aware recommendations based on retailer profiles.
 
-f) Data Handling
+## f) Data Handling
 
 Data Sources Used: Seeded product catalog + synthetic order data
 Preprocessing Methods: Standardization of product categories, mapping retailer purchase histories
 Storage / Pipeline Setup: MongoDB collections (users, products, orders, recommendations)
 
-g) Implementation Plan
+## g) Implementation Plan
 
 Initial Setup & Environment: FastAPI backend, React frontend, MongoDB connection
 
@@ -65,7 +64,7 @@ Core Module Development: Auth, product listing, order handling, recommendation A
 Integration & Testing: Connected frontend to backend using Axios
 Final Deployment-ready Build: Ready to deploy via Docker/Cloud with .env configuration
 
-h) Performance & Validation
+## h) Performance & Validation
 
 Evaluation Metrics: Recommendation accuracy (relevance), diversity of suggestions, response time
 Testing Strategy: API endpoint testing with FastAPI TestClient + manual frontend flow tests
@@ -80,3 +79,43 @@ Microservice-friendly architecture
 Horizontal scaling of backend services
 NoSQL database supports large product catalogs and concurrent retailer requests
 
+## Team Members Contribution
+
+Member 1(Shaik Farjana): Backend Lead (FastAPI & APIs)
+
+Set up FastAPI backend (server.py)
+Implement authentication (OTP) & user management
+Build core APIs:
+/api/products → fetch product catalog
+/api/orders → place/view orders
+/api/recommendations → recommendation results
+
+Member 2(Shaik Abdul Aziz): Database & Data Handling
+
+Design MongoDB collections (users, products, orders, recommendations)
+Seed product & retailer data (/api/seed-data)
+Handle data preprocessing:
+Normalize product categories
+Maintain order history for recommendation logic
+Ensure indexes & query optimization
+
+Member 3(Divya Kotha): AI/Recommendation System
+
+Implement hybrid recommendation logic:
+Rule-based filtering (most sold, frequently bought)
+LLM-powered personalization (Emergent API)
+Build integration function:
+Input: retailer purchase history
+Output: ranked list of recommendations
+Add notification logic after order placement
+
+
+Member 4(Ibrahim Baig): Frontend Lead (React + UI/UX)
+
+Build React frontend (App.js)
+Implement pages/components:
+Login/OTP auth
+Product listing & categories
+Cart & order placement
+Recommendation popup/notification
+Connect frontend to backend using Axios
