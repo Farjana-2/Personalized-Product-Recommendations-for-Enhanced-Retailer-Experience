@@ -28,6 +28,7 @@ Architecture Diagram / Workflow:
                                  ↘
                                   [LLM (Emergent API)]
 
+                                
 Data Flow Explanation:
 
 User logs in with OTP → backend verifies and stores user.
