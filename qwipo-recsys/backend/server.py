@@ -1,398 +1,524 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
 from pathlib import Path
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, EmailStr
 from typing import List, Optional, Dict, Any
 import uuid
-from datetime import datetime, timezone
-import random
+from datetime import datetime, timezone, timedelta
+import jwt
 import asyncio
-from emergentintegrations.llm.chat import LlmChat, UserMessage
-import json
+from collections import defaultdict, Counter
+import random
+import hashlib
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
+
+# Security
+import hashlib
+security = HTTPBearer()
+SECRET_KEY = "your-secret-key-change-this-in-production"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
-# Create the main app without a prefix
-app = FastAPI(title="Qwipo B2B Marketplace", description="Intelligent Product Recommendation System")
-
-# Create a router with the /api prefix
+# Create the main app
+app = FastAPI(title="Qwipo B2B Recommendation System")
 api_router = APIRouter(prefix="/api")
 
-# Pydantic Models
+# Models
+class User(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    email: EmailStr
+    business_name: str
+    business_type: str  # kirana, restaurant, small_business
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    is_active: bool = True
+
+class UserCreate(BaseModel):
+    email: EmailStr
+    password: str
+    business_name: str
+    business_type: str
+
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+    user: User
+
 class Product(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     name: str
-    description: str
     category: str
     subcategory: str
-    brand: str
+    business_types: List[str]  # which business types this product is relevant for
     price: float
     unit: str
-    image_url: Optional[str] = None
-    stock_quantity: int = 0
-    tags: List[str] = []
+    description: str
+    tags: List[str]
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    is_active: bool = True
 
-class ProductCreate(BaseModel):
-    name: str
-    description: str
-    category: str
-    subcategory: str
-    brand: str
-    price: float
-    unit: str
-    image_url: Optional[str] = None
-    stock_quantity: int = 0
-    tags: List[str] = []
-
-class User(BaseModel):
+class Purchase(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    phone_number: str
-    business_name: str
-    business_type: str
-    verified: bool = False
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-
-class UserCreate(BaseModel):
-    phone_number: str
-    business_name: str
-    business_type: str
-
-class OTPRequest(BaseModel):
-    phone_number: str
-
-class OTPVerify(BaseModel):
-    phone_number: str
-    otp: str
-
-class CartItem(BaseModel):
+    user_id: str
     product_id: str
     quantity: int
-
-class Order(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    user_id: str
-    items: List[CartItem]
     total_amount: float
-    status: str = "pending"
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-
-class OrderCreate(BaseModel):
-    items: List[CartItem]
+    purchase_date: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class Recommendation(BaseModel):
-    product_id: str
-    product_name: str
-    reason: str
-    confidence_score: float
-    recommendation_type: str  # "cross_sell", "upsell", "repurchase", "trending"
-
-class NotificationCreate(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     user_id: str
-    title: str
-    message: str
-    type: str = "recommendation"
+    product_id: str
+    recommendation_type: str  # trending, collaborative, content_based, hybrid
+    score: float
+    reasons: List[str]
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class Notification(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     user_id: str
     title: str
     message: str
-    type: str
-    read: bool = False
+    notification_type: str  # recommendation, trending, restock
+    data: Dict[str, Any] = {}
+    is_read: bool = False
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
-def get_ai_chat():
-    api_key = os.environ.get('EMERGENT_LLM_KEY')
-    return LlmChat(
-        api_key=api_key,
-        session_id="qwipo-recommendations",
-        system_message="You are an intelligent B2B product recommendation expert for kirana stores and small retailers. Analyze purchase patterns and suggest relevant FMCG products to increase order value and repeat purchases."
-    ).with_model("openai", "gpt-4o")
-      
-@api_router.post("/auth/send-otp")
-async def send_otp(request: OTPRequest):
-    # In production, integrate with SMS service
-    # For MVP, we'll simulate OTP generation
-    otp = str(random.randint(100000, 999999))
-    
-    # Store OTP in database (expires in 5 minutes)
-    otp_data = {
-        "phone_number": request.phone_number,
-        "otp": otp,
-        "expires_at": datetime.now(timezone.utc).timestamp() + 300,
-        "created_at": datetime.now(timezone.utc)
-    }
-    await db.otps.insert_one(otp_data)
-    
-    return {"message": f"OTP sent to {request.phone_number}", "otp": otp}  # Remove OTP in production
+# Helper functions
+def verify_password(plain_password, hashed_password):
+    try:
+        # Use simple SHA256 for demo purposes
+        hash_obj = hashlib.sha256(plain_password.encode())
+        return hash_obj.hexdigest() == hashed_password
+    except Exception as e:
+        logger.error(f"Password verification error: {str(e)}")
+        return False
 
-@api_router.post("/auth/verify-otp")
-async def verify_otp(request: OTPVerify):
-    
-    otp_record = await db.otps.find_one({
-        "phone_number": request.phone_number,
-        "otp": request.otp
-    })
-    
-    if not otp_record or otp_record["expires_at"] < datetime.now(timezone.utc).timestamp():
-        raise HTTPException(status_code=400, detail="Invalid or expired OTP")
-    
-    user = await db.users.find_one({"phone_number": request.phone_number})
-    if not user:
-        # New user registration flow
-        return {"verified": True, "new_user": True, "phone_number": request.phone_number}
-    
+def get_password_hash(password):
+    try:
+        # Use simple SHA256 for demo purposes
+        hash_obj = hashlib.sha256(password.encode())
+        return hash_obj.hexdigest()
+    except Exception as e:
+        logger.error(f"Password hashing error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Password hashing failed")
 
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.now(timezone.utc) + expires_delta
+    else:
+        expire = datetime.now(timezone.utc) + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None:
+            raise credentials_exception
+    except jwt.PyJWTError:
+        raise credentials_exception
+    
+    user = await db.users.find_one({"email": email})
+    if user is None:
+        raise credentials_exception
+    return User(**user)
+
+# Initialize sample data
+async def init_sample_data():
+    # Check if data already exists
+    existing_products = await db.products.count_documents({})
+    if existing_products > 0:
+        return
+    
+    # Sample products for different business types
+    sample_products = [
+        # Kirana store products
+        {"name": "Basmati Rice 5kg", "category": "Groceries", "subcategory": "Grains", "business_types": ["kirana", "restaurant"], "price": 450.0, "unit": "kg", "description": "Premium basmati rice", "tags": ["rice", "premium", "bulk"]},
+        {"name": "Cooking Oil 1L", "category": "Groceries", "subcategory": "Oil", "business_types": ["kirana", "restaurant"], "price": 120.0, "unit": "liter", "description": "Refined cooking oil", "tags": ["oil", "cooking", "essential"]},
+        {"name": "Sugar 1kg", "category": "Groceries", "subcategory": "Sweeteners", "business_types": ["kirana", "restaurant"], "price": 45.0, "unit": "kg", "description": "White sugar", "tags": ["sugar", "sweet", "basic"]},
+        {"name": "Tea Leaves 250g", "category": "Beverages", "subcategory": "Tea", "business_types": ["kirana", "restaurant"], "price": 180.0, "unit": "gm", "description": "Assam tea leaves", "tags": ["tea", "beverage", "popular"]},
+        {"name": "Biscuits Pack", "category": "Snacks", "subcategory": "Packaged", "business_types": ["kirana"], "price": 25.0, "unit": "pack", "description": "Glucose biscuits", "tags": ["biscuit", "snack", "kids"]},
+        
+        # Restaurant supplies
+        {"name": "Onions 10kg", "category": "Vegetables", "subcategory": "Bulb", "business_types": ["restaurant"], "price": 300.0, "unit": "kg", "description": "Fresh onions bulk", "tags": ["onion", "vegetable", "bulk", "fresh"]},
+        {"name": "Tomatoes 5kg", "category": "Vegetables", "subcategory": "Fruit vegetable", "business_types": ["restaurant"], "price": 150.0, "unit": "kg", "description": "Fresh tomatoes", "tags": ["tomato", "vegetable", "fresh"]},
+        {"name": "Disposable Cups 100pc", "category": "Packaging", "subcategory": "Disposables", "business_types": ["restaurant"], "price": 80.0, "unit": "pack", "description": "Paper cups for beverages", "tags": ["cups", "disposable", "packaging"]},
+        {"name": "Aluminum Foil Roll", "category": "Packaging", "subcategory": "Wrapping", "business_types": ["restaurant"], "price": 120.0, "unit": "roll", "description": "Food grade aluminum foil", "tags": ["foil", "packaging", "food-safe"]},
+        
+        # Small business essentials
+        {"name": "A4 Paper 500 Sheets", "category": "Stationery", "subcategory": "Paper", "business_types": ["small_business"], "price": 350.0, "unit": "ream", "description": "White A4 printing paper", "tags": ["paper", "office", "printing"]},
+        {"name": "Ball Pens 10pc", "category": "Stationery", "subcategory": "Writing", "business_types": ["small_business"], "price": 50.0, "unit": "pack", "description": "Blue ink ball pens", "tags": ["pen", "writing", "office"]},
+        {"name": "Cleaning Detergent 1L", "category": "Cleaning", "subcategory": "Liquids", "business_types": ["small_business", "restaurant"], "price": 80.0, "unit": "liter", "description": "Multi-purpose cleaner", "tags": ["cleaner", "detergent", "hygiene"]},
+        {"name": "Tissue Papers 200pc", "category": "Hygiene", "subcategory": "Paper products", "business_types": ["restaurant", "small_business"], "price": 45.0, "unit": "pack", "description": "Soft tissue papers", "tags": ["tissue", "hygiene", "soft"]},
+        
+        # Common items
+        {"name": "Hand Sanitizer 500ml", "category": "Hygiene", "subcategory": "Sanitizers", "business_types": ["kirana", "restaurant", "small_business"], "price": 120.0, "unit": "bottle", "description": "70% alcohol sanitizer", "tags": ["sanitizer", "hygiene", "covid-safe"]},
+        {"name": "Plastic Bags 100pc", "category": "Packaging", "subcategory": "Bags", "business_types": ["kirana", "restaurant"], "price": 60.0, "unit": "pack", "description": "Eco-friendly plastic bags", "tags": ["bags", "packaging", "carry"]}
+    ]
+    
+    # Add product objects
+    product_docs = []
+    for product_data in sample_products:
+        product = Product(**product_data)
+        product_docs.append(product.dict())
+    
+    await db.products.insert_many(product_docs)
+    logger.info(f"Inserted {len(product_docs)} sample products")
+
+# Routes
+@api_router.post("/auth/register", response_model=Token)
+async def register(user_data: UserCreate):
+    try:
+        # Check if user exists
+        existing_user = await db.users.find_one({"email": user_data.email})
+        if existing_user:
+            raise HTTPException(status_code=400, detail="Email already registered")
+        
+        # Create new user
+        hashed_password = get_password_hash(user_data.password)
+        user = User(
+            email=user_data.email,
+            business_name=user_data.business_name,
+            business_type=user_data.business_type
+        )
+        
+        user_dict = user.dict()
+        user_dict["password_hash"] = hashed_password
+        
+        await db.users.insert_one(user_dict)
+        
+        # Create access token
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = create_access_token(
+            data={"sub": user.email}, expires_delta=access_token_expires
+        )
+        
+        return Token(access_token=access_token, token_type="bearer", user=user)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Registration error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Registration failed: {str(e)}")
+
+@api_router.post("/auth/login", response_model=Token)
+async def login(user_credentials: UserLogin):
+    user = await db.users.find_one({"email": user_credentials.email})
+    if not user or not verify_password(user_credentials.password, user.get("password_hash")):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user["email"]}, expires_delta=access_token_expires
+    )
+    
     user_obj = User(**user)
-    return {"verified": True, "new_user": False, "user": user_obj}
-
-@api_router.post("/auth/register", response_model=User)
-async def register_user(user_data: UserCreate):
- 
-    existing = await db.users.find_one({"phone_number": user_data.phone_number})
-    if existing:
-        raise HTTPException(status_code=400, detail="User already exists")
-    
-    user_dict = user_data.dict()
-    user_obj = User(**user_dict, verified=True)
-    await db.users.insert_one(user_obj.dict())
-    return user_obj
+    return Token(access_token=access_token, token_type="bearer", user=user_obj)
 
 @api_router.get("/products", response_model=List[Product])
-async def get_products(category: Optional[str] = None, search: Optional[str] = None):
-    query = {}
-    if category:
-        query["category"] = category
-    if search:
-        query["$or"] = [
-            {"name": {"$regex": search, "$options": "i"}},
-            {"description": {"$regex": search, "$options": "i"}},
-            {"tags": {"$in": [search]}}
-        ]
-    
-    products = await db.products.find(query).to_list(100)
+async def get_products(current_user: User = Depends(get_current_user)):
+    # Filter products relevant to user's business type
+    products = await db.products.find({
+        "business_types": current_user.business_type,
+        "is_active": True
+    }).to_list(length=None)
     return [Product(**product) for product in products]
 
-@api_router.get("/products/{product_id}", response_model=Product)
-async def get_product(product_id: str):
+@api_router.post("/purchases", response_model=Purchase)
+async def record_purchase(product_id: str, quantity: int, current_user: User = Depends(get_current_user)):
+    # Get product details
     product = await db.products.find_one({"id": product_id})
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
-    return Product(**product)
+    
+    total_amount = product["price"] * quantity
+    
+    purchase = Purchase(
+        user_id=current_user.id,
+        product_id=product_id,
+        quantity=quantity,
+        total_amount=total_amount
+    )
+    
+    await db.purchases.insert_one(purchase.dict())
+    
+    # Trigger recommendation generation (async)
+    asyncio.create_task(generate_recommendations_for_user(current_user.id))
+    
+    return purchase
 
-@api_router.get("/categories")
-async def get_categories():
-    categories = await db.products.distinct("category")
-    return {"categories": categories}
+@api_router.get("/purchases", response_model=List[Purchase])
+async def get_user_purchases(current_user: User = Depends(get_current_user)):
+    purchases = await db.purchases.find({"user_id": current_user.id}).to_list(length=None)
+    return [Purchase(**purchase) for purchase in purchases]
 
-@api_router.get("/recommendations/{user_id}", response_model=List[Recommendation])
-async def get_recommendations(user_id: str, recommendation_type: str = "all"):
-    # Get user's order history
-    orders = await db.orders.find({"user_id": user_id}).to_list(50)
+@api_router.get("/recommendations", response_model=List[Dict[str, Any]])
+async def get_recommendations(current_user: User = Depends(get_current_user)):
+    recommendations = await db.recommendations.find({
+        "user_id": current_user.id
+    }).sort("score", -1).limit(10).to_list(length=None)
     
-    if not orders:
-        # New user - show trending products
-        trending_products = await db.products.find().limit(5).to_list(5)
-        return [
-            Recommendation(
-                product_id=p["id"],
-                product_name=p["name"],
-                reason="Popular among similar businesses",
-                confidence_score=0.7,
-                recommendation_type="trending"
-            ) for p in trending_products
-        ]
-    
-    try:
-        chat = get_ai_chat()
-        
-        order_data = []
-        for order in orders:
-            for item in order["items"]:
-                product = await db.products.find_one({"id": item["product_id"]})
-                if product:
-                    order_data.append({
-                        "product_name": product["name"],
-                        "category": product["category"],
-                        "price": product["price"],
-                        "quantity": item["quantity"]
-                    })
-        
-        prompt = f"""
-        Based on this B2B retailer's purchase history: {json.dumps(order_data)}
-        
-        Recommend 5 products that would:
-        1. Increase their order value (cross-sell/upsell)
-        2. Encourage repeat purchases
-        3. Match their business patterns
-        
-        Return recommendations in this JSON format:
-        [
-            {{
-                "product_name": "Product Name",
-                "reason": "Why this product fits",
-                "confidence_score": 0.8,
-                "recommendation_type": "cross_sell"
-            }}
-        ]
-        """
-        
-        user_message = UserMessage(text=prompt)
-        ai_response = await chat.send_message(user_message)
-        
-        recommendations = []
-        try:
-            ai_recs = json.loads(ai_response.strip())
-            for rec in ai_recs[:5]:
-                # Find matching product
-                product = await db.products.find_one({
-                    "name": {"$regex": rec["product_name"], "$options": "i"}
-                })
-                if product:
-                    recommendations.append(Recommendation(
-                        product_id=product["id"],
-                        product_name=product["name"],
-                        reason=rec["reason"],
-                        confidence_score=rec["confidence_score"],
-                        recommendation_type=rec["recommendation_type"]
-                    ))
-        except:
-            pass
-            
-    except Exception as e:
-        logging.error(f"AI recommendation error: {e}")
-    
-    if len(recommendations) < 3:
-        recent_products = []
-        for order in orders[-3:]:  # Last 3 orders
-            for item in order["items"]:
-                recent_products.append(item["product_id"])
-        
-        if recent_products:
-            recent_product_data = await db.products.find({"id": {"$in": recent_products}}).to_list(10)
-            categories = [p["category"] for p in recent_product_data]
-            
-            similar_products = await db.products.find({
-                "category": {"$in": categories},
-                "id": {"$nin": recent_products}
-            }).limit(5).to_list(5)
-            
-            for product in similar_products:
-                if len(recommendations) < 5:
-                    recommendations.append(Recommendation(
-                        product_id=product["id"],
-                        product_name=product["name"],
-                        reason="Frequently bought together with your recent purchases",
-                        confidence_score=0.6,
-                        recommendation_type="cross_sell"
-                    ))
-    
-    return recommendations
-
-# Orders
-@api_router.post("/orders", response_model=Order)
-async def create_order(order_data: OrderCreate, user_id: str):
-    # Calculate total amount
-    total_amount = 0
-    for item in order_data.items:
-        product = await db.products.find_one({"id": item.product_id})
+    # Enrich with product details
+    enriched_recommendations = []
+    for rec in recommendations:
+        product = await db.products.find_one({"id": rec["product_id"]})
         if product:
-            total_amount += product["price"] * item.quantity
+            enriched_rec = {
+                "recommendation": Recommendation(**rec),
+                "product": Product(**product)
+            }
+            enriched_recommendations.append(enriched_rec)
     
-    order_dict = order_data.dict()
-    order_obj = Order(**order_dict, user_id=user_id, total_amount=total_amount)
-    await db.orders.insert_one(order_obj.dict())
-    
-    await create_recommendation_notification(user_id)
-    
-    return order_obj
+    return enriched_recommendations
 
-@api_router.get("/orders/{user_id}", response_model=List[Order])
-async def get_user_orders(user_id: str):
-    orders = await db.orders.find({"user_id": user_id}).to_list(50)
-    return [Order(**order) for order in orders]
+@api_router.get("/trending", response_model=List[Dict[str, Any]])
+async def get_trending_products(current_user: User = Depends(get_current_user)):
+    # Get trending products based on recent purchases
+    pipeline = [
+        {"$match": {"purchase_date": {"$gte": datetime.now(timezone.utc) - timedelta(days=7)}}},
+        {"$group": {"_id": "$product_id", "total_purchases": {"$sum": "$quantity"}}},
+        {"$sort": {"total_purchases": -1}},
+        {"$limit": 5}
+    ]
+    
+    trending_data = await db.purchases.aggregate(pipeline).to_list(length=None)
+    
+    trending_products = []
+    for item in trending_data:
+        product = await db.products.find_one({"id": item["_id"]})
+        if product and current_user.business_type in product["business_types"]:
+            trending_products.append({
+                "product": Product(**product),
+                "popularity_score": item["total_purchases"]
+            })
+    
+    return trending_products
 
-@api_router.get("/notifications/{user_id}", response_model=List[Notification])
-async def get_notifications(user_id: str):
-    notifications = await db.notifications.find({"user_id": user_id}).sort("created_at", -1).to_list(50)
+@api_router.get("/notifications", response_model=List[Notification])
+async def get_notifications(current_user: User = Depends(get_current_user)):
+    notifications = await db.notifications.find({
+        "user_id": current_user.id
+    }).sort("created_at", -1).limit(20).to_list(length=None)
     return [Notification(**notification) for notification in notifications]
 
 @api_router.put("/notifications/{notification_id}/read")
-async def mark_notification_read(notification_id: str):
+async def mark_notification_read(notification_id: str, current_user: User = Depends(get_current_user)):
     await db.notifications.update_one(
-        {"id": notification_id},
-        {"$set": {"read": True}}
+        {"id": notification_id, "user_id": current_user.id},
+        {"$set": {"is_read": True}}
     )
     return {"message": "Notification marked as read"}
 
-async def create_recommendation_notification(user_id: str):
-    """Create a notification about new recommendations after order"""
-    notification = Notification(
-        user_id=user_id,
-        title="New Recommendations Available!",
-        message="Based on your recent order, we found products that can boost your business. Check them out!",
-        type="recommendation"
-    )
-    await db.notifications.insert_one(notification.dict())
+# Recommendation algorithms
+async def generate_recommendations_for_user(user_id: str):
+    """Generate hybrid recommendations for a user"""
+    user = await db.users.find_one({"id": user_id})
+    if not user:
+        return
+    
+    user_obj = User(**user)
+    
+    # Get user's purchase history
+    purchases = await db.purchases.find({"user_id": user_id}).to_list(length=None)
+    
+    # Collaborative filtering recommendations
+    collab_recs = await get_collaborative_recommendations(user_obj, purchases)
+    
+    # Content-based recommendations
+    content_recs = await get_content_based_recommendations(user_obj, purchases)
+    
+    # Combine and score recommendations
+    all_recommendations = collab_recs + content_recs
+    
+    # Remove duplicates and sort by score
+    unique_recommendations = {}
+    for rec in all_recommendations:
+        if rec.product_id not in unique_recommendations or rec.score > unique_recommendations[rec.product_id].score:
+            unique_recommendations[rec.product_id] = rec
+    
+    final_recommendations = list(unique_recommendations.values())
+    final_recommendations.sort(key=lambda x: x.score, reverse=True)
+    
+    # Store top 10 recommendations
+    if final_recommendations:
+        # Clear old recommendations
+        await db.recommendations.delete_many({"user_id": user_id})
+        
+        # Insert new recommendations
+        rec_docs = [rec.dict() for rec in final_recommendations[:10]]
+        await db.recommendations.insert_many(rec_docs)
+        
+        # Create notification for top recommendation
+        if final_recommendations:
+            top_rec = final_recommendations[0]
+            product = await db.products.find_one({"id": top_rec.product_id})
+            if product:
+                notification = Notification(
+                    user_id=user_id,
+                    title="New Product Recommendation!",
+                    message=f"Based on your recent purchases, we recommend {product['name']}",
+                    notification_type="recommendation",
+                    data={"product_id": product["id"], "recommendation_id": top_rec.id}
+                )
+                await db.notifications.insert_one(notification.dict())
 
-# Test endpoint to get current OTP for any phone number
-@api_router.get("/auth/get-otp/{phone_number}")
-async def get_current_otp(phone_number: str):
-    """For testing purposes - get current valid OTP for a phone number"""
-    otp_record = await db.otps.find_one(
-        {"phone_number": phone_number},
-        sort=[("created_at", -1)]  # Get the latest OTP
-    )
+async def get_collaborative_recommendations(user: User, purchases: List[dict]) -> List[Recommendation]:
+    """Get recommendations based on similar users' purchases"""
+    if not purchases:
+        return []
     
-    if not otp_record:
-        raise HTTPException(status_code=404, detail="No OTP found for this number")
+    # Find users with similar purchase patterns
+    user_products = {p["product_id"] for p in purchases}
     
-    if otp_record["expires_at"] < datetime.now(timezone.utc).timestamp():
-        raise HTTPException(status_code=400, detail="OTP has expired")
+    # Get all users' purchases
+    all_purchases = await db.purchases.find({"user_id": {"$ne": user.id}}).to_list(length=None)
     
-    return {"phone_number": phone_number, "otp": otp_record["otp"], "message": "Current valid OTP"}
+    # Group by user and find similarity
+    user_similarities = defaultdict(int)
+    user_purchases_map = defaultdict(set)
+    
+    for purchase in all_purchases:
+        user_purchases_map[purchase["user_id"]].add(purchase["product_id"])
+    
+    for other_user_id, other_products in user_purchases_map.items():
+        similarity = len(user_products.intersection(other_products)) / len(user_products.union(other_products))
+        if similarity > 0.1:  # Minimum similarity threshold
+            user_similarities[other_user_id] = similarity
+    
+    # Get product recommendations from similar users
+    recommended_products = Counter()
+    for other_user_id, similarity in user_similarities.items():
+        other_products = user_purchases_map[other_user_id]
+        new_products = other_products - user_products
+        for product_id in new_products:
+            recommended_products[product_id] += similarity
+    
+    # Convert to recommendation objects
+    recommendations = []
+    for product_id, score in recommended_products.most_common(5):
+        rec = Recommendation(
+            user_id=user.id,
+            product_id=product_id,
+            recommendation_type="collaborative",
+            score=score,
+            reasons=["Users with similar purchase patterns also bought this"]
+        )
+        recommendations.append(rec)
+    
+    return recommendations
 
-# Seed data function
-@api_router.post("/seed-data")
-async def seed_sample_data():
-    # Sample FMCG products
-    sample_products = [
-        {"name": "Tata Salt", "description": "Iodized Salt 1kg", "category": "Grocery", "subcategory": "Spices & Condiments", "brand": "Tata", "price": 22.0, "unit": "1kg", "stock_quantity": 100, "tags": ["salt", "grocery", "tata"]},
-        {"name": "Maggi Noodles", "description": "Masala Noodles 70g Pack", "category": "Grocery", "subcategory": "Instant Food", "brand": "Nestle", "price": 14.0, "unit": "70g", "stock_quantity": 200, "tags": ["noodles", "instant", "maggi"]},
-        {"name": "Britannia Biscuits", "description": "Good Day Butter Cookies 100g", "category": "Snacks", "subcategory": "Biscuits", "brand": "Britannia", "price": 20.0, "unit": "100g", "stock_quantity": 150, "tags": ["biscuits", "cookies", "britannia"]},
-        {"name": "Amul Milk", "description": "Full Cream Milk 1L", "category": "Dairy", "subcategory": "Milk", "brand": "Amul", "price": 60.0, "unit": "1L", "stock_quantity": 80, "tags": ["milk", "dairy", "amul"]},
-        {"name": "Surf Excel", "description": "Detergent Powder 1kg", "category": "Household", "subcategory": "Cleaning", "brand": "Hindustan Unilever", "price": 180.0, "unit": "1kg", "stock_quantity": 50, "tags": ["detergent", "cleaning", "surf"]},
-        {"name": "Parle-G Biscuits", "description": "Glucose Biscuits 200g", "category": "Snacks", "subcategory": "Biscuits", "brand": "Parle", "price": 25.0, "unit": "200g", "stock_quantity": 120, "tags": ["biscuits", "glucose", "parle"]},
-        {"name": "Colgate Toothpaste", "description": "Strong Teeth 200g", "category": "Personal Care", "subcategory": "Oral Care", "brand": "Colgate", "price": 95.0, "unit": "200g", "stock_quantity": 90, "tags": ["toothpaste", "oral care", "colgate"]},
-        {"name": "Toor Dal", "description": "Arhar Dal 1kg", "category": "Grocery", "subcategory": "Pulses", "brand": "Generic", "price": 140.0, "unit": "1kg", "stock_quantity": 60, "tags": ["dal", "pulses", "arhar"]},
-        {"name": "Sunflower Oil", "description": "Fortune Sunflower Oil 1L", "category": "Grocery", "subcategory": "Cooking Oil", "brand": "Fortune", "price": 120.0, "unit": "1L", "stock_quantity": 40, "tags": ["oil", "cooking", "fortune"]},
-        {"name": "Basmati Rice", "description": "Premium Basmati Rice 5kg", "category": "Grocery", "subcategory": "Rice & Grains", "brand": "India Gate", "price": 450.0, "unit": "5kg", "stock_quantity": 30, "tags": ["rice", "basmati", "premium"]}
-    ]
+async def get_content_based_recommendations(user: User, purchases: List[dict]) -> List[Recommendation]:
+    """Get recommendations based on user's purchase patterns and product attributes"""
+    if not purchases:
+        # For new users, recommend popular products for their business type
+        popular_products = await db.products.find({
+            "business_types": user.business_type,
+            "is_active": True
+        }).limit(3).to_list(length=None)
+        
+        recommendations = []
+        for i, product in enumerate(popular_products):
+            rec = Recommendation(
+                user_id=user.id,
+                product_id=product["id"],
+                recommendation_type="content_based",
+                score=0.8 - (i * 0.1),
+                reasons=["Popular among similar businesses"]
+            )
+            recommendations.append(rec)
+        return recommendations
     
-    for product_data in sample_products:
-        product = Product(**product_data)
-        existing = await db.products.find_one({"name": product.name})
-        if not existing:
-            await db.products.insert_one(product.dict())
+    # Analyze user's purchase patterns
+    purchased_products = await db.products.find({
+        "id": {"$in": [p["product_id"] for p in purchases]}
+    }).to_list(length=None)
     
-    return {"message": "Sample data seeded successfully"}
+    # Extract categories and tags from purchased products
+    categories = Counter()
+    tags = Counter()
+    
+    for product in purchased_products:
+        categories[product["category"]] += 1
+        for tag in product["tags"]:
+            tags[tag] += 1
+    
+    # Find similar products
+    similar_products = await db.products.find({
+        "business_types": user.business_type,
+        "is_active": True,
+        "id": {"$nin": [p["product_id"] for p in purchases]},
+        "$or": [
+            {"category": {"$in": list(categories.keys())}},
+            {"tags": {"$in": list(tags.keys())}}
+        ]
+    }).to_list(length=None)
+    
+    # Score products based on similarity
+    recommendations = []
+    for product in similar_products[:5]:
+        score = 0.0
+        reasons = []
+        
+        # Category match
+        if product["category"] in categories:
+            score += 0.4
+            reasons.append(f"Similar to your {product['category']} purchases")
+        
+        # Tag matches
+        matching_tags = set(product["tags"]).intersection(set(tags.keys()))
+        if matching_tags:
+            score += 0.3 * len(matching_tags)
+            reasons.append(f"Matches your interests: {', '.join(list(matching_tags)[:2])}")
+        
+        if score > 0.2:
+            rec = Recommendation(
+                user_id=user.id,
+                product_id=product["id"],
+                recommendation_type="content_based",
+                score=min(score, 1.0),
+                reasons=reasons
+            )
+            recommendations.append(rec)
+    
+    return recommendations
 
 @api_router.get("/")
 async def root():
-    return {"message": "Qwipo B2B Marketplace API - Intelligent Recommendation System"}
+    return {"message": "Qwipo B2B Recommendation System API"}
 
-# Include the router in the main app
+# Initialize data on startup
+@app.on_event("startup")
+async def startup_event():
+    await init_sample_data()
+    logger.info("Application started successfully")
+
 app.include_router(api_router)
 
 app.add_middleware(
